@@ -1,4 +1,5 @@
 import './style.css';
+import appIconUrl from './assets/images/labcert-icon.png';
 import {
   ChangeVaultPassword,
   CheckVaultPath,
@@ -367,7 +368,7 @@ function renderLockScreen() {
       </div>
       <div class="lock-card">
         <div class="lock-header">
-          <div class="brand-icon">LC</div>
+          <div class="brand-icon"><img src="${appIconUrl}" alt="LabCert" /></div>
           <div>
             <h2>LabCert Vault</h2>
             <p>${isCreate ? 'Create a new password-encrypted vault.' : 'Open and unlock your encrypted PKI vault.'}</p>
@@ -1253,7 +1254,7 @@ function render() {
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-icon">LC</div>
+          <div class="brand-icon"><img src="${appIconUrl}" alt="LabCert" /></div>
           <div class="brand-text">
             <h1>LabCert</h1>
             <span>Homelab PKI Studio</span>
