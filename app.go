@@ -177,9 +177,42 @@ func (a *App) LockVault() {
 	a.vault.Lock()
 }
 
-// ChangeVaultPassword re-encrypts the unlocked vault with a new password.
-func (a *App) ChangeVaultPassword(newPassword string) error {
-	return a.vault.ChangePassword(newPassword)
+// VerifyMasterPassword checks whether password matches the unlocked vault's master password.
+func (a *App) VerifyMasterPassword(password string) error {
+	return a.vault.VerifyPassword(password)
+}
+
+// ChangeVaultPassword verifies currentPassword and re-encrypts the unlocked vault with newPassword.
+func (a *App) ChangeVaultPassword(currentPassword, newPassword string) error {
+	return a.vault.ChangePassword(currentPassword, newPassword)
+}
+
+// ExportVaultBackup saves an encrypted copy of the current vault file via native dialog.
+func (a *App) ExportVaultBackup() (string, error) {
+	if a.ctx == nil {
+		return "", errors.New("application context not initialized")
+	}
+	if !a.vault.IsUnlocked() {
+		return "", errors.New("vault is locked")
+	}
+	srcPath := a.vault.Path()
+	raw, err := os.ReadFile(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("reading vault for backup: %w", err)
+	}
+	defaultName := fmt.Sprintf("labcert-backup-%s.labcert", time.Now().Format("2006-01-02"))
+	target, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "Export Encrypted Vault Backup",
+		DefaultFilename: defaultName,
+		Filters:         []runtime.FileFilter{{DisplayName: "LabCert Vault (*.labcert)", Pattern: "*.labcert"}},
+	})
+	if err != nil || target == "" {
+		return "", err
+	}
+	if err := os.WriteFile(target, raw, 0600); err != nil {
+		return "", err
+	}
+	return target, nil
 }
 
 // ChooseVaultFile opens a native file dialog to select or create a .labcert vault file.
@@ -208,15 +241,18 @@ func (a *App) ListItems() ([]vault.VaultItemSummary, error) {
 
 func summarizeToVaultSummary(it vault.VaultItem) vault.VaultItemSummary {
 	return vault.VaultItemSummary{
-		ID:        it.ID,
-		Kind:      it.Kind,
-		Name:      it.Name,
-		IssuerID:  it.IssuerID,
-		CreatedAt: it.CreatedAt,
-		HasKey:    it.KeyPEM != "",
-		HasCert:   it.CertPEM != "",
-		HasCSR:    it.CSRPEM != "",
-		Summary:   it.Summary,
+		ID:           it.ID,
+		Kind:         it.Kind,
+		Name:         it.Name,
+		IssuerID:     it.IssuerID,
+		CreatedAt:    it.CreatedAt,
+		HasKey:       it.KeyPEM != "",
+		HasCert:      it.CertPEM != "",
+		HasCSR:       it.CSRPEM != "",
+		Revoked:      it.Revoked,
+		RevokedAt:    it.RevokedAt,
+		RevokeReason: it.RevokeReason,
+		Summary:      it.Summary,
 	}
 }
 
@@ -403,9 +439,72 @@ func (a *App) SignCSR(req SignCSRRequest) (vault.VaultItemSummary, error) {
 	return summarizeToVaultSummary(item), nil
 }
 
-// DeleteItem removes an item from the vault.
-func (a *App) DeleteItem(id string) error {
+// DeleteItem removes an item from the vault. Deleting a CA requires masterPassword.
+func (a *App) DeleteItem(id, masterPassword string) error {
+	item, err := a.vault.GetItem(id)
+	if err != nil {
+		return err
+	}
+	if item.Kind == vault.KindRootCA || item.Kind == vault.KindIntermediateCA {
+		if err := a.vault.VerifyPassword(masterPassword); err != nil {
+			return err
+		}
+	}
 	return a.vault.DeleteItem(id)
+}
+
+// RevokeItem marks a certificate as revoked inside the vault.
+func (a *App) RevokeItem(id string, reason int) error {
+	return a.vault.RevokeItem(id, reason)
+}
+
+// ExportCRL generates and saves a signed X.509 CRL for all revoked certs issued by caID.
+func (a *App) ExportCRL(caID string, validDays int) (string, error) {
+	if a.ctx == nil {
+		return "", errors.New("application context not initialized")
+	}
+	ca, err := a.vault.GetItem(caID)
+	if err != nil {
+		return "", err
+	}
+	if ca.CertPEM == "" || ca.KeyPEM == "" {
+		return "", errors.New("selected CA does not have both a certificate and private key")
+	}
+	all, err := a.vault.AllItems()
+	if err != nil {
+		return "", err
+	}
+	var revoked []pki.RevokedEntry
+	for _, it := range all {
+		if it.IssuerID == caID && it.Revoked && it.CertPEM != "" {
+			var revTime time.Time
+			if it.RevokedAt != nil {
+				revTime = *it.RevokedAt
+			}
+			revoked = append(revoked, pki.RevokedEntry{
+				CertPEM:   it.CertPEM,
+				RevokedAt: revTime,
+				Reason:    it.RevokeReason,
+			})
+		}
+	}
+	crlPEM, err := pki.GenerateCRL(ca.CertPEM, ca.KeyPEM, revoked, validDays)
+	if err != nil {
+		return "", err
+	}
+	defaultName := sanitizeFilename(ca.Name) + ".crl.pem"
+	target, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "Export Certificate Revocation List",
+		DefaultFilename: defaultName,
+		Filters:         []runtime.FileFilter{{DisplayName: "CRL PEM (*.crl.pem, *.crl, *.pem)", Pattern: "*.crl.pem;*.crl;*.pem"}},
+	})
+	if err != nil || target == "" {
+		return "", err
+	}
+	if err := os.WriteFile(target, []byte(crlPEM), 0644); err != nil {
+		return "", err
+	}
+	return target, nil
 }
 
 func (a *App) buildChain(item vault.VaultItem) (fullChain string, caChain []string) {
@@ -453,8 +552,11 @@ func (a *App) GetItemPEM(id string) (ItemPEMs, error) {
 	}, nil
 }
 
-// RevealPrivateKey returns the decrypted private key PEM for explicit copy/inspection.
-func (a *App) RevealPrivateKey(id string) (string, error) {
+// RevealPrivateKey verifies masterPassword and returns the decrypted private key PEM.
+func (a *App) RevealPrivateKey(id, masterPassword string) (string, error) {
+	if err := a.vault.VerifyPassword(masterPassword); err != nil {
+		return "", err
+	}
 	item, err := a.vault.GetItem(id)
 	if err != nil {
 		return "", err
@@ -463,6 +565,28 @@ func (a *App) RevealPrivateKey(id string) (string, error) {
 		return "", errors.New("this item does not have a stored private key")
 	}
 	return item.KeyPEM, nil
+}
+
+// CopyPrivateKeyTemporarily copies a private key to the OS clipboard and clears it after 30 seconds.
+func (a *App) CopyPrivateKeyTemporarily(id, masterPassword string) error {
+	if a.ctx == nil {
+		return errors.New("application context not initialized")
+	}
+	keyPEM, err := a.RevealPrivateKey(id, masterPassword)
+	if err != nil {
+		return err
+	}
+	if err := runtime.ClipboardSetText(a.ctx, keyPEM); err != nil {
+		return err
+	}
+	ctx := a.ctx
+	go func(secret string) {
+		time.Sleep(30 * time.Second)
+		if current, err := runtime.ClipboardGetText(ctx); err == nil && current == secret {
+			_ = runtime.ClipboardSetText(ctx, "")
+		}
+	}(keyPEM)
+	return nil
 }
 
 func sanitizeFilename(name string) string {
@@ -475,9 +599,15 @@ func sanitizeFilename(name string) string {
 }
 
 // ExportArtifact saves a certificate, fullchain, private key, CSR, or PKCS#12 file via native dialog.
-func (a *App) ExportArtifact(id, format, p12Password string) (string, error) {
+// Sensitive exports ("key" and "p12") require masterPassword verification.
+func (a *App) ExportArtifact(id, format, p12Password, masterPassword string) (string, error) {
 	if a.ctx == nil {
 		return "", errors.New("application context not initialized")
+	}
+	if format == "key" || format == "p12" {
+		if err := a.vault.VerifyPassword(masterPassword); err != nil {
+			return "", err
+		}
 	}
 	item, err := a.vault.GetItem(id)
 	if err != nil {
@@ -600,6 +730,13 @@ func (a *App) OpenPEMFile() (string, error) {
 	})
 	if err != nil || path == "" {
 		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Size() > pki.MaxPEMInputBytes {
+		return "", errors.New("file exceeds 1 MiB PEM size limit")
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

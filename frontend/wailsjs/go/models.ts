@@ -278,6 +278,10 @@ export namespace vault {
 	    hasKey: boolean;
 	    hasCert: boolean;
 	    hasCsr: boolean;
+	    revoked?: boolean;
+	    // Go type: time
+	    revokedAt?: any;
+	    revokeReason?: number;
 	    summary: pki.CertSummary;
 	
 	    static createFrom(source: any = {}) {
@@ -294,6 +298,9 @@ export namespace vault {
 	        this.hasKey = source["hasKey"];
 	        this.hasCert = source["hasCert"];
 	        this.hasCsr = source["hasCsr"];
+	        this.revoked = source["revoked"];
+	        this.revokedAt = this.convertValues(source["revokedAt"], null);
+	        this.revokeReason = source["revokeReason"];
 	        this.summary = this.convertValues(source["summary"], pki.CertSummary);
 	    }
 	

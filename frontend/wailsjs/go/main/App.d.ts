@@ -4,11 +4,13 @@ import {pki} from '../models';
 import {vault} from '../models';
 import {main} from '../models';
 
-export function ChangeVaultPassword(arg1:string):Promise<void>;
+export function ChangeVaultPassword(arg1:string,arg2:string):Promise<void>;
 
 export function CheckVaultPath(arg1:string):Promise<boolean>;
 
 export function ChooseVaultFile(arg1:boolean):Promise<string>;
+
+export function CopyPrivateKeyTemporarily(arg1:string,arg2:string):Promise<void>;
 
 export function CreateCSR(arg1:pki.CertOptions):Promise<vault.VaultItemSummary>;
 
@@ -20,9 +22,13 @@ export function CreateRootCA(arg1:pki.CertOptions):Promise<vault.VaultItemSummar
 
 export function CreateVault(arg1:string,arg2:string):Promise<void>;
 
-export function DeleteItem(arg1:string):Promise<void>;
+export function DeleteItem(arg1:string,arg2:string):Promise<void>;
 
-export function ExportArtifact(arg1:string,arg2:string,arg3:string):Promise<string>;
+export function ExportArtifact(arg1:string,arg2:string,arg3:string,arg4:string):Promise<string>;
+
+export function ExportCRL(arg1:string,arg2:number):Promise<string>;
+
+export function ExportVaultBackup():Promise<string>;
 
 export function GetItemPEM(arg1:string):Promise<main.ItemPEMs>;
 
@@ -36,10 +42,14 @@ export function LockVault():Promise<void>;
 
 export function OpenPEMFile():Promise<string>;
 
-export function RevealPrivateKey(arg1:string):Promise<string>;
+export function RevealPrivateKey(arg1:string,arg2:string):Promise<string>;
+
+export function RevokeItem(arg1:string,arg2:number):Promise<void>;
 
 export function SignCSR(arg1:main.SignCSRRequest):Promise<vault.VaultItemSummary>;
 
 export function UnlockVault(arg1:string,arg2:string):Promise<void>;
 
 export function VerifyCertificate(arg1:string):Promise<main.VerifyResult>;
+
+export function VerifyMasterPassword(arg1:string):Promise<void>;

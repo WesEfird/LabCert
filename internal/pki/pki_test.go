@@ -1,7 +1,11 @@
 package pki
 
 import (
+	"crypto/x509"
+	"encoding/pem"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestFullPKIChainAndVerify(t *testing.T) {
@@ -129,5 +133,64 @@ func TestValidationErrors(t *testing.T) {
 		IPAddresses: []string{"not-an-ip"},
 	}, rootPEM, rootKey); err == nil {
 		t.Fatal("expected error for invalid IP SAN")
+	}
+}
+
+func TestSecurityHardeningPKI(t *testing.T) {
+	rootPEM, rootKey, _, err := GenerateRootCA(CertOptions{
+		Subject:      SubjectOptions{CommonName: "Hardening Root CA"},
+		KeyAlgorithm: "ECDSA-P256",
+		ValidityDays: 365,
+		PathLen:      1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// #11: ECDSA leaf cert should NOT receive KeyEncipherment even if requested
+	leafPEM, leafKey, leafSum, err := GenerateLeafCert(CertOptions{
+		Subject:      SubjectOptions{CommonName: "ecdsa.home.arpa"},
+		KeyAlgorithm: "ECDSA-P256",
+		ValidityDays: 397,
+		KeyUsages:    []string{"digitalSignature", "keyEncipherment"},
+		ExtKeyUsages: []string{"serverAuth"},
+	}, rootPEM, rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ku := range leafSum.KeyUsages {
+		if ku == "Key Encipherment" {
+			t.Fatal("ECDSA leaf certificate should not include Key Encipherment")
+		}
+	}
+
+	// #7: PKCS#12 rejects empty or short password
+	if _, err := ExportPKCS12(leafPEM, leafKey, []string{rootPEM}, ""); err == nil {
+		t.Fatal("expected ExportPKCS12 to reject empty password")
+	}
+	if _, err := ExportPKCS12(leafPEM, leafKey, []string{rootPEM}, "short"); err == nil {
+		t.Fatal("expected ExportPKCS12 to reject <8 char password")
+	}
+
+	// #11: CRL generation includes revoked leaf certificate
+	crlPEM, err := GenerateCRL(rootPEM, rootKey, []RevokedEntry{
+		{CertPEM: leafPEM, RevokedAt: time.Now().UTC(), Reason: 1},
+	}, 30)
+	if err != nil {
+		t.Fatalf("GenerateCRL failed: %v", err)
+	}
+	block, _ := pem.Decode([]byte(crlPEM))
+	if block == nil || block.Type != "X509 CRL" {
+		t.Fatal("expected valid X509 CRL PEM block")
+	}
+	rl, err := x509.ParseRevocationList(block.Bytes)
+	if err != nil || len(rl.RevokedCertificateEntries) != 1 {
+		t.Fatalf("expected 1 revoked entry in CRL, got err=%v len=%d", err, len(rl.RevokedCertificateEntries))
+	}
+
+	// #12: InspectPEM enforces 1 MiB limit
+	huge := strings.Repeat("A", MaxPEMInputBytes+10)
+	if _, err := InspectPEM(huge); err == nil {
+		t.Fatal("expected InspectPEM to reject input > 1 MiB")
 	}
 }

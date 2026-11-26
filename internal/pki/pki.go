@@ -241,17 +241,22 @@ func parseSANs(dns []string, ips []string, emails []string, uris []string) ([]st
 	return outDNS, outIPs, outEmails, outURIs, nil
 }
 
-func parseKeyUsage(usages []string, isCA bool) x509.KeyUsage {
+const MaxPEMInputBytes = 1 << 20 // 1 MiB safety limit
+
+func parseKeyUsage(usages []string, isCA bool, pub crypto.PublicKey) x509.KeyUsage {
 	if isCA {
 		return x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature
 	}
+	_, isRSA := pub.(*rsa.PublicKey)
 	var ku x509.KeyUsage
 	for _, u := range usages {
 		switch strings.ToLower(strings.TrimSpace(u)) {
 		case "digitalsignature":
 			ku |= x509.KeyUsageDigitalSignature
 		case "keyencipherment":
-			ku |= x509.KeyUsageKeyEncipherment
+			if isRSA {
+				ku |= x509.KeyUsageKeyEncipherment
+			}
 		case "contentcommitment", "nonrepudiation":
 			ku |= x509.KeyUsageContentCommitment
 		case "keyagreement":
@@ -261,7 +266,10 @@ func parseKeyUsage(usages []string, isCA bool) x509.KeyUsage {
 		}
 	}
 	if ku == 0 {
-		ku = x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
+		ku = x509.KeyUsageDigitalSignature
+		if isRSA {
+			ku |= x509.KeyUsageKeyEncipherment
+		}
 	}
 	return ku
 }
@@ -477,7 +485,7 @@ func GenerateRootCA(opts CertOptions) (string, string, CertSummary, error) {
 		Subject:               subject,
 		NotBefore:             now,
 		NotAfter:              now.AddDate(0, 0, opts.ValidityDays),
-		KeyUsage:              parseKeyUsage(nil, true),
+		KeyUsage:              parseKeyUsage(nil, true, priv.Public()),
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		SubjectKeyId:          ski,
@@ -546,7 +554,7 @@ func GenerateIntermediateCA(opts CertOptions, issuerCertPEM, issuerKeyPEM string
 		Subject:               subject,
 		NotBefore:             now,
 		NotAfter:              notAfter,
-		KeyUsage:              parseKeyUsage(nil, true),
+		KeyUsage:              parseKeyUsage(nil, true, priv.Public()),
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		SubjectKeyId:          ski,
@@ -624,7 +632,7 @@ func GenerateLeafCert(opts CertOptions, issuerCertPEM, issuerKeyPEM string) (str
 		Subject:               subject,
 		NotBefore:             now,
 		NotAfter:              notAfter,
-		KeyUsage:              parseKeyUsage(opts.KeyUsages, false),
+		KeyUsage:              parseKeyUsage(opts.KeyUsages, false, priv.Public()),
 		ExtKeyUsage:           ekus,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
@@ -731,7 +739,7 @@ func SignCSR(csrPEM, issuerCertPEM, issuerKeyPEM string, validityDays int, isCA 
 		Subject:               csr.Subject,
 		NotBefore:             now,
 		NotAfter:              notAfter,
-		KeyUsage:              parseKeyUsage(keyUsages, isCA),
+		KeyUsage:              parseKeyUsage(keyUsages, isCA, csr.PublicKey),
 		BasicConstraintsValid: true,
 		IsCA:                  isCA,
 		DNSNames:              csr.DNSNames,
@@ -767,6 +775,9 @@ func SignCSR(csrPEM, issuerCertPEM, issuerKeyPEM string, validityDays int, isCA 
 
 // InspectPEM parses one or more certificates or a CSR from PEM text.
 func InspectPEM(pemText string) (InspectResult, error) {
+	if len(pemText) > MaxPEMInputBytes {
+		return InspectResult{}, errors.New("PEM input exceeds 1 MiB size limit")
+	}
 	rest := []byte(strings.TrimSpace(pemText))
 	if len(rest) == 0 {
 		return InspectResult{}, errors.New("PEM input is empty")
@@ -839,8 +850,66 @@ func VerifyAgainstCAs(certPEM string, rootsPEM, intermediatesPEM []string) (bool
 	return true, fmt.Sprintf("Verified (%d valid trust chain)", len(chains))
 }
 
+// RevokedEntry describes a revoked certificate for CRL generation.
+type RevokedEntry struct {
+	CertPEM   string
+	RevokedAt time.Time
+	Reason    int
+}
+
+// GenerateCRL builds a signed X.509 v2 Certificate Revocation List in PEM format.
+func GenerateCRL(issuerCertPEM, issuerKeyPEM string, revoked []RevokedEntry, validDays int) (string, error) {
+	issuerCert, err := parseCertPEM(issuerCertPEM)
+	if err != nil {
+		return "", fmt.Errorf("parsing issuer cert: %w", err)
+	}
+	if !issuerCert.IsCA {
+		return "", errors.New("selected issuer is not a Certificate Authority")
+	}
+	issuerKey, err := parsePrivateKeyPEM(issuerKeyPEM)
+	if err != nil {
+		return "", fmt.Errorf("parsing issuer key: %w", err)
+	}
+	if validDays <= 0 {
+		validDays = 30
+	}
+
+	entries := make([]x509.RevocationListEntry, 0, len(revoked))
+	for _, r := range revoked {
+		cert, err := parseCertPEM(r.CertPEM)
+		if err != nil {
+			continue
+		}
+		revTime := r.RevokedAt
+		if revTime.IsZero() {
+			revTime = time.Now().UTC()
+		}
+		entries = append(entries, x509.RevocationListEntry{
+			SerialNumber:   cert.SerialNumber,
+			RevocationTime: revTime,
+			ReasonCode:     r.Reason,
+		})
+	}
+
+	now := time.Now().UTC()
+	tmpl := &x509.RevocationList{
+		Number:                    big.NewInt(now.Unix()),
+		ThisUpdate:                now,
+		NextUpdate:                now.AddDate(0, 0, validDays),
+		RevokedCertificateEntries: entries,
+	}
+	der, err := x509.CreateRevocationList(rand.Reader, tmpl, issuerCert, issuerKey)
+	if err != nil {
+		return "", fmt.Errorf("creating CRL: %w", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der})), nil
+}
+
 // ExportPKCS12 bundles a certificate, its private key, and optional CA chain into a .p12/.pfx archive.
 func ExportPKCS12(certPEM, keyPEM string, caCertsPEM []string, password string) ([]byte, error) {
+	if len(password) < 8 {
+		return nil, errors.New("PKCS#12 export password must be at least 8 characters")
+	}
 	cert, err := parseCertPEM(certPEM)
 	if err != nil {
 		return nil, err

@@ -4,6 +4,7 @@ import {
   ChangeVaultPassword,
   CheckVaultPath,
   ChooseVaultFile,
+  CopyPrivateKeyTemporarily,
   CreateCSR,
   CreateIntermediateCA,
   CreateLeafCert,
@@ -11,6 +12,8 @@ import {
   CreateVault,
   DeleteItem,
   ExportArtifact,
+  ExportCRL,
+  ExportVaultBackup,
   GetItemPEM,
   GetVaultStatus,
   InspectPEM,
@@ -18,6 +21,7 @@ import {
   LockVault,
   OpenPEMFile,
   RevealPrivateKey,
+  RevokeItem,
   SignCSR,
   UnlockVault,
   VerifyCertificate,
@@ -39,6 +43,20 @@ interface ConfirmDialogState {
   message: string;
   confirmLabel: string;
   onConfirm: () => Promise<void>;
+}
+
+interface PasswordPromptState {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  danger?: boolean;
+  onSubmit: (masterPassword: string) => Promise<void>;
+}
+
+interface CSRPreviewState {
+  request: main.SignCSRRequest;
+  summary: pki.CertSummary;
+  issuerName: string;
 }
 
 interface State {
@@ -64,7 +82,13 @@ interface State {
   showChangePasswordModal: boolean;
   p12ExportTargetId: string | null;
   confirmDialog: ConfirmDialogState | null;
+  passwordPrompt: PasswordPromptState | null;
+  csrPreview: CSRPreviewState | null;
 }
+
+const IDLE_LOCK_MS = 10 * 60 * 1000; // 10 minutes
+let idleTimer: number | null = null;
+let keyHideTimer: number | null = null;
 
 const savedTheme = (localStorage.getItem('labcert-theme') as Theme) || 'dark';
 document.documentElement.setAttribute('data-theme', savedTheme);
@@ -92,6 +116,8 @@ const state: State = {
   showChangePasswordModal: false,
   p12ExportTargetId: null,
   confirmDialog: null,
+  passwordPrompt: null,
+  csrPreview: null,
 };
 
 const appEl = document.getElementById('app')!;
@@ -119,6 +145,39 @@ function esc(val: unknown): string {
     .replace(/"/g, '&quot;');
 }
 
+function resetIdleTimer() {
+  if (idleTimer !== null) {
+    window.clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+  if (!state.status.unlocked) return;
+  idleTimer = window.setTimeout(async () => {
+    if (!state.status.unlocked) return;
+    await LockVault();
+    clearSensitiveUIState();
+    await refreshVault();
+    showToast('Vault auto-locked after 10 minutes of inactivity');
+  }, IDLE_LOCK_MS);
+}
+
+['mousemove', 'keydown', 'click', 'scroll'].forEach((evt) => {
+  window.addEventListener(evt, resetIdleTimer, { passive: true });
+});
+
+function clearSensitiveUIState() {
+  state.selectedItem = null;
+  state.selectedPEMs = null;
+  state.revealedKey = null;
+  state.passwordPrompt = null;
+  state.p12ExportTargetId = null;
+  state.showChangePasswordModal = false;
+  state.csrPreview = null;
+  if (keyHideTimer !== null) {
+    window.clearTimeout(keyHideTimer);
+    keyHideTimer = null;
+  }
+}
+
 function toggleTheme() {
   state.theme = state.theme === 'dark' ? 'light' : 'dark';
   localStorage.setItem('labcert-theme', state.theme);
@@ -137,7 +196,7 @@ function showToast(msg: string, type: 'info' | 'success' | 'error' = 'info') {
   el.className = `toast ${type}`;
   el.textContent = msg;
   container.appendChild(el);
-  setTimeout(() => el.remove(), 4200);
+  setTimeout(() => el.remove(), 4500);
 }
 
 function errMsg(e: unknown): string {
@@ -172,6 +231,28 @@ function kindBadge(kind: string): string {
     default:
       return `<span class="badge badge-neutral">${esc(kind)}</span>`;
   }
+}
+
+function passwordStrengthLabel(pw: string): { text: string; color: string } {
+  if (!pw) return { text: 'Minimum 12 characters', color: 'var(--text-muted)' };
+  let score = 0;
+  if (pw.length >= 12) score++;
+  if (pw.length >= 16) score++;
+  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) score++;
+  if (/\d/.test(pw)) score++;
+  if (/[^a-zA-Z0-9]/.test(pw)) score++;
+  if (pw.length < 12) return { text: `Too short (${pw.length}/12 chars)`, color: 'var(--danger)' };
+  if (score <= 2) return { text: 'Fair — consider a longer passphrase', color: 'var(--amber)' };
+  if (score <= 4) return { text: 'Strong password', color: 'var(--emerald)' };
+  return { text: 'Very strong passphrase', color: 'var(--emerald)' };
+}
+
+function suggestNewVaultPath(currentPath: string): string {
+  if (!currentPath) return 'vault-new.labcert';
+  if (currentPath.toLowerCase().endsWith('.labcert')) {
+    return currentPath.slice(0, -8) + '-new.labcert';
+  }
+  return currentPath + '-new.labcert';
 }
 
 function isIPv4(s: string): boolean {
@@ -219,22 +300,27 @@ async function refreshVault() {
   state.status = await GetVaultStatus();
   if (state.status.unlocked) {
     state.items = (await ListItems()) || [];
+    resetIdleTimer();
   } else {
     state.items = [];
+    if (idleTimer !== null) {
+      window.clearTimeout(idleTimer);
+      idleTimer = null;
+    }
   }
   render();
 }
 
 function getAvailableCAs(): vault.VaultItemSummary[] {
   return state.items.filter(
-    (it) => (it.kind === 'root_ca' || it.kind === 'intermediate_ca') && it.hasKey && it.hasCert
+    (it) => (it.kind === 'root_ca' || it.kind === 'intermediate_ca') && it.hasKey && it.hasCert && !it.revoked
   );
 }
 
 function getIssuerOptions(selectedId = ''): string {
   const cas = getAvailableCAs();
   if (cas.length === 0) {
-    return '<option value="">No CAs in vault yet — create a Root CA first</option>';
+    return '<option value="">No active CAs in vault yet — create a Root CA first</option>';
   }
   const effectiveId = selectedId || cas[0].id;
   return cas
@@ -390,13 +476,16 @@ function renderLockScreen() {
             ${
               !isCreate && !exists
                 ? `<span class="help-text" style="color:var(--amber);">No vault file found at this path. Browse to an existing vault or switch to <strong>Create New Vault</strong>.</span>`
-                : `<span class="help-text">Encrypted with Argon2id + AES-256-GCM.</span>`
+                : isCreate && exists
+                ? `<span class="help-text" style="color:var(--danger);">A vault already exists at this path. Choose a different filename to avoid overwriting it.</span>`
+                : `<span class="help-text">Encrypted with Argon2id + AES-256-GCM (authenticated header).</span>`
             }
           </div>
 
           <div class="field">
             <label>Master Password</label>
-            <input type="password" id="vault-password" placeholder="${isCreate ? 'At least 8 characters' : 'Enter vault password'}" autofocus required />
+            <input type="password" id="vault-password" placeholder="${isCreate ? 'At least 12 characters' : 'Enter vault password'}" autofocus required />
+            ${isCreate ? `<span class="help-text" id="pw-strength-hint">Minimum 12 characters</span>` : ''}
           </div>
 
           ${
@@ -411,7 +500,7 @@ function renderLockScreen() {
           }
 
           <div style="display:flex;justify-content:flex-end;margin-top:4px;">
-            <button type="submit" class="btn btn-primary">
+            <button type="submit" class="btn btn-primary" ${isCreate && exists ? 'disabled' : ''}>
               ${isCreate ? 'Create & Unlock' : 'Unlock Vault'}
             </button>
           </div>
@@ -422,14 +511,28 @@ function renderLockScreen() {
 
   document.getElementById('btn-theme-toggle')?.addEventListener('click', toggleTheme);
 
-  document.getElementById('tab-auth-open')?.addEventListener('click', () => {
+  document.getElementById('tab-auth-open')?.addEventListener('click', async () => {
     state.authMode = 'open';
+    state.status = await GetVaultStatus();
     renderLockScreen();
   });
 
-  document.getElementById('tab-auth-create')?.addEventListener('click', () => {
+  document.getElementById('tab-auth-create')?.addEventListener('click', async () => {
     state.authMode = 'create';
+    if (state.status.exists) {
+      const suggested = suggestNewVaultPath(state.status.path);
+      state.status.path = suggested;
+      state.status.exists = await CheckVaultPath(suggested);
+    }
     renderLockScreen();
+  });
+
+  document.getElementById('vault-password')?.addEventListener('input', (e) => {
+    const hint = document.getElementById('pw-strength-hint');
+    if (!hint) return;
+    const res = passwordStrengthLabel((e.target as HTMLInputElement).value);
+    hint.textContent = res.text;
+    hint.style.color = res.color;
   });
 
   document.getElementById('vault-path')?.addEventListener('change', async (e) => {
@@ -461,6 +564,10 @@ function renderLockScreen() {
         await UnlockVault(path, pw);
         showToast('Vault unlocked', 'success');
       } else {
+        if (pw.length < 12) {
+          showToast('Master password must be at least 12 characters', 'error');
+          return;
+        }
         const confirmPw = (document.getElementById('vault-password-confirm') as HTMLInputElement).value;
         if (pw !== confirmPw) {
           showToast('Passwords do not match', 'error');
@@ -489,14 +596,15 @@ function itemMatchesSearch(it: vault.VaultItemSummary, q: string): boolean {
 
 function renderItemRow(it: vault.VaultItemSummary): string {
   const days = it.hasCert ? daysRemaining(it.summary.notAfter) : null;
-  const expiryBadge =
-    days === null
-      ? ''
-      : days <= 0
-      ? '<span class="badge badge-danger">Expired</span>'
-      : days <= 30
-      ? `<span class="badge badge-csr">Expires in ${days}d</span>`
-      : `<span class="badge badge-neutral">${days}d left</span>`;
+  const expiryBadge = it.revoked
+    ? '<span class="badge badge-danger">Revoked</span>'
+    : days === null
+    ? ''
+    : days <= 0
+    ? '<span class="badge badge-danger">Expired</span>'
+    : days <= 30
+    ? `<span class="badge badge-csr">Expires in ${days}d</span>`
+    : `<span class="badge badge-neutral">${days}d left</span>`;
   const sansCount = (it.summary.dnsNames?.length || 0) + (it.summary.ipAddresses?.length || 0);
   const isCA = it.kind === 'root_ca' || it.kind === 'intermediate_ca';
 
@@ -517,7 +625,7 @@ function renderItemRow(it: vault.VaultItemSummary): string {
       </div>
       <div class="item-actions">
         ${
-          isCA && it.hasKey
+          isCA && it.hasKey && !it.revoked
             ? `
             ${
               it.kind === 'root_ca'
@@ -563,7 +671,7 @@ function renderStatsHtml(): string {
   const leafCount = state.items.filter((i) => i.kind === 'leaf_cert').length;
   const csrCount = state.items.filter((i) => i.kind === 'csr').length;
   const expiringCount = state.items.filter((i) => {
-    if (!i.hasCert) return false;
+    if (!i.hasCert || i.revoked) return false;
     const d = daysRemaining(i.summary.notAfter);
     return d !== null && d <= 30;
   }).length;
@@ -821,13 +929,14 @@ function renderLeafCertPage(): string {
         </div>
         <div class="field">
           <label>Validity (Days)</label>
-          <input type="number" id="f-days" value="365" min="1" max="3650" />
+          <input type="number" id="f-days" value="397" min="1" max="3650" />
+          <span class="help-text" id="leaf-days-warn">397 days recommended for modern TLS compatibility.</span>
         </div>
         <div class="field span-2">
-          <label>Key Usage</label>
+          <label>Key Usage <span class="help-text">(Key Encipherment is automatically applied to RSA keys only)</span></label>
           <div class="checkbox-group">
             <label class="check-chip"><input type="checkbox" name="ku" value="digitalSignature" checked /> Digital Signature</label>
-            <label class="check-chip"><input type="checkbox" name="ku" value="keyEncipherment" checked /> Key Encipherment</label>
+            <label class="check-chip"><input type="checkbox" name="ku" value="keyEncipherment" checked /> Key Encipherment (RSA)</label>
             <label class="check-chip"><input type="checkbox" name="ku" value="contentCommitment" /> Content Commitment</label>
             <label class="check-chip"><input type="checkbox" name="ku" value="keyAgreement" /> Key Agreement</label>
           </div>
@@ -889,7 +998,7 @@ function renderCSRPage(): string {
         <div class="card-header">
           <div>
             <div class="card-title">Sign Certificate Signing Request</div>
-            <div class="card-subtitle">Sign an external CSR (paste or open file) or a CSR stored in your vault.</div>
+            <div class="card-subtitle">All CSRs are inspected and shown for review before signing.</div>
           </div>
           <button type="button" class="btn btn-secondary btn-sm" id="btn-open-csr-file">Load .csr File</button>
         </div>
@@ -915,7 +1024,7 @@ function renderCSRPage(): string {
           </div>
           <div class="field">
             <label>Validity (Days)</label>
-            <input type="number" id="f-days" value="365" min="1" max="3650" />
+            <input type="number" id="f-days" value="397" min="1" max="3650" />
           </div>
           <div class="field">
             <label>Certificate Type</label>
@@ -933,7 +1042,7 @@ function renderCSRPage(): string {
             </div>
           </div>
           <div class="span-2" style="display:flex;justify-content:flex-end;">
-            <button type="submit" class="btn btn-primary">Sign CSR</button>
+            <button type="submit" class="btn btn-primary">Review &amp; Sign CSR</button>
           </div>
         </form>
       </div>
@@ -973,7 +1082,7 @@ function renderInspectorPage(): string {
       <div class="card-header">
         <div>
           <div class="card-title">X.509 Certificate & CSR Inspector</div>
-          <div class="card-subtitle">Paste any PEM certificate, chain, or CSR, or load a file from disk.</div>
+          <div class="card-subtitle">Paste any PEM certificate, chain, or CSR, or load a file from disk (max 1 MiB).</div>
         </div>
         <button type="button" class="btn btn-secondary btn-sm" id="btn-inspect-open">Open File</button>
       </div>
@@ -1014,10 +1123,21 @@ function renderDetailDrawer(): string {
   const it = state.selectedItem;
   if (!it || !state.selectedPEMs) return '';
   const pems = state.selectedPEMs;
+  const isCA = it.kind === 'root_ca' || it.kind === 'intermediate_ca';
 
   let tabContent = '';
   if (state.drawerTab === 'overview') {
-    tabContent = renderSummaryKV(it.summary);
+    tabContent = `
+      ${
+        it.revoked
+          ? `<div class="card" style="border-color:var(--danger);background:var(--danger-soft);padding:12px;">
+               <strong style="color:var(--danger);">Revoked</strong>
+               <div class="help-text" style="color:var(--text-primary);margin-top:2px;">Revoked on ${formatDate(it.revokedAt)}. Export the issuer CA's CRL to publish this revocation.</div>
+             </div>`
+          : ''
+      }
+      ${renderSummaryKV(it.summary)}
+    `;
   } else if (state.drawerTab === 'pem') {
     tabContent = `
       ${
@@ -1054,12 +1174,19 @@ function renderDetailDrawer(): string {
           ? `
         <div class="field">
           <div style="display:flex;justify-content:space-between;align-items:center;">
-            <label>Private Key (Encrypted in Vault)</label>
-            <button class="btn btn-secondary btn-xs" id="btn-reveal-key">
-              ${state.revealedKey ? 'Copy Private Key' : 'Reveal Private Key'}
-            </button>
+            <label>Private Key (Master Password Required)</label>
+            <div style="display:flex;gap:6px;">
+              <button class="btn btn-secondary btn-xs" id="btn-reveal-key">
+                ${state.revealedKey ? 'Hide Key' : 'Reveal Key'}
+              </button>
+              <button class="btn btn-secondary btn-xs" id="btn-copy-key-temp">Copy (Auto-Clear 30s)</button>
+            </div>
           </div>
-          ${state.revealedKey ? `<div class="pem-box">${esc(state.revealedKey)}</div>` : '<span class="help-text">Hidden by default for security.</span>'}
+          ${
+            state.revealedKey
+              ? `<div class="pem-box">${esc(state.revealedKey)}</div><span class="help-text">Auto-hides after 30 seconds. Prefer Export over clipboard copy.</span>`
+              : '<span class="help-text">Hidden by default. Requires master password verification.</span>'
+          }
         </div>
       `
           : ''
@@ -1086,7 +1213,7 @@ function renderDetailDrawer(): string {
           pems.hasKey
             ? `<div class="export-card">
                 <strong>Private Key (.key)</strong>
-                <span>Unencrypted PKCS#8 PEM key for servers.</span>
+                <span>Unencrypted PKCS#8 PEM (for server deployment). Requires master password.</span>
                 <button class="btn btn-secondary btn-sm" data-export="key">Save .key</button>
               </div>`
             : ''
@@ -1104,8 +1231,17 @@ function renderDetailDrawer(): string {
           pems.certPem && pems.hasKey
             ? `<div class="export-card">
                 <strong>PKCS#12 (.p12 / .pfx)</strong>
-                <span>Password-protected bundle with key &amp; chain.</span>
+                <span>Password-protected bundle (min 8 chars) with key &amp; chain.</span>
                 <button class="btn btn-primary btn-sm" id="btn-export-p12">Save .p12</button>
+              </div>`
+            : ''
+        }
+        ${
+          isCA && pems.hasKey
+            ? `<div class="export-card">
+                <strong>Revocation List (.crl.pem)</strong>
+                <span>Signed X.509 v2 CRL of revoked certs issued by this CA.</span>
+                <button class="btn btn-secondary btn-sm" id="btn-export-crl">Export CRL</button>
               </div>`
             : ''
         }
@@ -1120,6 +1256,7 @@ function renderDetailDrawer(): string {
           <div style="display:flex;align-items:center;gap:10px;min-width:0;">
             <strong style="font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(it.name)}</strong>
             ${kindBadge(it.kind)}
+            ${it.revoked ? '<span class="badge badge-danger">Revoked</span>' : ''}
           </div>
           <button class="btn btn-secondary btn-sm" id="btn-close-drawer">Close</button>
         </div>
@@ -1133,7 +1270,13 @@ function renderDetailDrawer(): string {
         <div class="drawer-body">${tabContent}</div>
 
         <div class="drawer-footer">
-          <span class="help-text">Created ${formatDate(it.createdAt)}</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            ${
+              it.hasCert && !it.revoked && it.kind !== 'root_ca'
+                ? '<button class="btn btn-secondary btn-sm" id="btn-revoke-item">Revoke</button>'
+                : `<span class="help-text">Created ${formatDate(it.createdAt)}</span>`
+            }
+          </div>
           <button class="btn btn-danger btn-sm" id="btn-delete-item">Delete Item</button>
         </div>
       </div>
@@ -1152,9 +1295,16 @@ function renderP12Modal(): string {
         </div>
         <form id="form-p12" class="modal-body">
           <div class="field">
-            <label>Bundle Password</label>
-            <input type="password" id="p12-pass" placeholder="Leave blank or enter export password" autofocus />
-            <span class="help-text">Protects the private key inside the .p12 / .pfx file.</span>
+            <label>Vault Master Password <span class="req">*</span></label>
+            <input type="password" id="p12-master-pass" placeholder="Confirm vault master password" required autofocus />
+          </div>
+          <div class="field">
+            <label>PKCS#12 Bundle Password (min 8 chars) <span class="req">*</span></label>
+            <input type="password" id="p12-pass" placeholder="Password to encrypt the .p12 file" required />
+          </div>
+          <div class="field">
+            <label>Confirm Bundle Password <span class="req">*</span></label>
+            <input type="password" id="p12-pass-confirm" placeholder="Repeat bundle password" required />
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;">
             <button type="submit" class="btn btn-primary">Save .p12 File</button>
@@ -1176,11 +1326,16 @@ function renderChangePasswordModal(): string {
         </div>
         <form id="form-cpw" class="modal-body">
           <div class="field">
-            <label>New Master Password</label>
-            <input type="password" id="cpw-new" placeholder="At least 8 characters" required autofocus />
+            <label>Current Master Password <span class="req">*</span></label>
+            <input type="password" id="cpw-current" placeholder="Enter current password" required autofocus />
           </div>
           <div class="field">
-            <label>Confirm New Password</label>
+            <label>New Master Password (min 12 chars) <span class="req">*</span></label>
+            <input type="password" id="cpw-new" placeholder="At least 12 characters" required />
+            <span class="help-text" id="cpw-strength-hint">Minimum 12 characters</span>
+          </div>
+          <div class="field">
+            <label>Confirm New Password <span class="req">*</span></label>
             <input type="password" id="cpw-confirm" placeholder="Repeat new password" required />
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;">
@@ -1206,6 +1361,69 @@ function renderConfirmModal(): string {
           <div style="display:flex;justify-content:flex-end;gap:8px;">
             <button class="btn btn-secondary" id="btn-confirm-no">Cancel</button>
             <button class="btn btn-danger" id="btn-confirm-yes">${esc(state.confirmDialog.confirmLabel)}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderPasswordPromptModal(): string {
+  if (!state.passwordPrompt) return '';
+  const p = state.passwordPrompt;
+  return `
+    <div class="modal-backdrop" id="pwprompt-backdrop">
+      <div class="modal">
+        <div class="modal-header">
+          <strong>${esc(p.title)}</strong>
+          <button class="btn btn-secondary btn-sm" id="btn-pwprompt-cancel">Cancel</button>
+        </div>
+        <form id="form-pwprompt" class="modal-body">
+          <p style="color:var(--text-secondary);font-size:13px;">${esc(p.message)}</p>
+          <div class="field">
+            <label>Master Password</label>
+            <input type="password" id="pwprompt-input" placeholder="Enter vault master password" required autofocus />
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:8px;">
+            <button type="button" class="btn btn-secondary" id="btn-pwprompt-no">Cancel</button>
+            <button type="submit" class="btn ${p.danger ? 'btn-danger' : 'btn-primary'}">${esc(p.confirmLabel)}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function renderCSRPreviewModal(): string {
+  if (!state.csrPreview) return '';
+  const { request, summary, issuerName } = state.csrPreview;
+  return `
+    <div class="modal-backdrop" id="csrpreview-backdrop">
+      <div class="modal" style="max-width:560px;">
+        <div class="modal-header">
+          <strong>Review CSR Before Signing</strong>
+          <button class="btn btn-secondary btn-sm" id="btn-csrpreview-cancel">Cancel</button>
+        </div>
+        <div class="modal-body">
+          ${
+            request.isCA
+              ? `<div class="card" style="border-color:var(--danger);background:var(--danger-soft);padding:12px;">
+                   <strong style="color:var(--danger);">Warning: Signing as Intermediate CA</strong>
+                   <div class="help-text" style="color:var(--text-primary);margin-top:2px;">This grants the CSR holder authority to issue trusted certificates under <strong>${esc(issuerName)}</strong>.</div>
+                 </div>`
+              : ''
+          }
+          <div class="kv-grid">
+            <div class="kv-label">Signing CA</div><div class="kv-val">${esc(issuerName)}</div>
+            <div class="kv-label">Validity</div><div class="kv-val">${request.validityDays} days</div>
+            <div class="kv-label">Subject</div><div class="kv-val mono">${esc(summary.subject)}</div>
+            <div class="kv-label">Key</div><div class="kv-val">${esc(summary.keyAlgorithm)} (${summary.keyBits}-bit)</div>
+            <div class="kv-label">DNS SANs</div><div class="kv-val mono">${summary.dnsNames?.length ? esc(summary.dnsNames.join(', ')) : 'None'}</div>
+            <div class="kv-label">IP SANs</div><div class="kv-val mono">${summary.ipAddresses?.length ? esc(summary.ipAddresses.join(', ')) : 'None'}</div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px;">
+            <button class="btn btn-secondary" id="btn-csrpreview-no">Cancel</button>
+            <button class="btn ${request.isCA ? 'btn-danger' : 'btn-primary'}" id="btn-csrpreview-confirm">Confirm &amp; Sign</button>
           </div>
         </div>
       </div>
@@ -1283,6 +1501,7 @@ function render() {
             </div>
             <div class="vault-path-text" title="${esc(state.status.path)}">${esc(state.status.path)}</div>
           </div>
+          <button class="btn btn-secondary btn-sm" id="btn-backup-vault">Export Vault Backup</button>
           <button class="btn btn-secondary btn-sm" id="btn-change-pw">Change Vault Password</button>
         </div>
       </aside>
@@ -1309,6 +1528,8 @@ function render() {
     ${renderP12Modal()}
     ${renderChangePasswordModal()}
     ${renderConfirmModal()}
+    ${renderPasswordPromptModal()}
+    ${renderCSRPreviewModal()}
   `;
 
   attachHandlers();
@@ -1382,11 +1603,18 @@ function attachHandlers() {
 
   document.getElementById('btn-lock-vault')?.addEventListener('click', async () => {
     await LockVault();
-    state.selectedItem = null;
-    state.selectedPEMs = null;
-    state.revealedKey = null;
+    clearSensitiveUIState();
     await refreshVault();
     showToast('Vault locked');
+  });
+
+  document.getElementById('btn-backup-vault')?.addEventListener('click', async () => {
+    try {
+      const saved = await ExportVaultBackup();
+      if (saved) showToast(`Encrypted backup saved to ${saved}`, 'success');
+    } catch (e) {
+      showToast(errMsg(e), 'error');
+    }
   });
 
   document.getElementById('btn-change-pw')?.addEventListener('click', () => {
@@ -1504,8 +1732,21 @@ function attachHandlers() {
     }
   });
 
-  // Leaf Cert Presets & SANs
+  // Leaf Cert Presets, Validity Warning & SANs
   attachSANHandlers();
+  document.getElementById('f-days')?.addEventListener('input', (e) => {
+    const warn = document.getElementById('leaf-days-warn');
+    if (!warn) return;
+    const days = parseInt((e.target as HTMLInputElement).value, 10) || 0;
+    if (days > 825) {
+      warn.textContent = 'Warning: Validity > 825 days is rejected by Apple/modern TLS clients.';
+      warn.style.color = 'var(--amber)';
+    } else {
+      warn.textContent = '397 days recommended for modern TLS compatibility.';
+      warn.style.color = 'var(--text-muted)';
+    }
+  });
+
   document.querySelectorAll<HTMLElement>('[data-preset]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const preset = btn.dataset.preset;
@@ -1554,7 +1795,7 @@ function attachHandlers() {
         dnsNames: state.sanEntries.filter((s) => s.type === 'dns').map((s) => s.value),
         ipAddresses: state.sanEntries.filter((s) => s.type === 'ip').map((s) => s.value),
         keyAlgorithm: (document.getElementById('f-algo') as HTMLSelectElement).value,
-        validityDays: parseInt((document.getElementById('f-days') as HTMLInputElement).value, 10) || 365,
+        validityDays: parseInt((document.getElementById('f-days') as HTMLInputElement).value, 10) || 397,
         keyUsages,
         extKeyUsages,
       });
@@ -1568,7 +1809,7 @@ function attachHandlers() {
     }
   });
 
-  // CSR Tabs & Forms
+  // CSR Tabs & Forms (with mandatory preview before signing)
   document.querySelectorAll<HTMLElement>('[data-csr-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.csrTab = btn.dataset.csrTab as 'generate' | 'sign';
@@ -1620,19 +1861,58 @@ function attachHandlers() {
         showToast('Please select an Issuer CA', 'error');
         return;
       }
+      const storedCsrId = (document.getElementById('f-stored-csr') as HTMLSelectElement).value;
+      let csrPem = (document.getElementById('f-csr-pem') as HTMLTextAreaElement).value.trim();
+      if (!csrPem && storedCsrId) {
+        const pems = await GetItemPEM(storedCsrId);
+        csrPem = pems.csrPem;
+      }
+      if (!csrPem) {
+        showToast('Please paste a CSR PEM or select a stored CSR', 'error');
+        return;
+      }
+      const inspected = await InspectPEM(csrPem);
+      if (inspected.type !== 'csr' || !inspected.valid || inspected.items.length === 0) {
+        showToast(inspected.warning || 'Invalid CSR PEM', 'error');
+        return;
+      }
+
       const extKeyUsages = Array.from(document.querySelectorAll<HTMLInputElement>('input[name="eku"]:checked')).map((c) => c.value);
       const isCA = (document.getElementById('f-sign-isca') as HTMLSelectElement).value === 'true';
-      const req = new main.SignCSRRequest({
-        name: (document.getElementById('f-name') as HTMLInputElement).value.trim(),
-        issuerId,
-        storedCsrId: (document.getElementById('f-stored-csr') as HTMLSelectElement).value,
-        csrPem: (document.getElementById('f-csr-pem') as HTMLTextAreaElement).value.trim(),
-        validityDays: parseInt((document.getElementById('f-days') as HTMLInputElement).value, 10) || 365,
-        isCA,
-        pathLen: isCA ? 0 : -1,
-        extKeyUsages,
-      });
-      await SignCSR(req);
+      const issuer = state.items.find((i) => i.id === issuerId);
+
+      state.csrPreview = {
+        request: new main.SignCSRRequest({
+          name: (document.getElementById('f-name') as HTMLInputElement).value.trim(),
+          issuerId,
+          storedCsrId,
+          csrPem,
+          validityDays: parseInt((document.getElementById('f-days') as HTMLInputElement).value, 10) || 397,
+          isCA,
+          pathLen: isCA ? 0 : -1,
+          extKeyUsages,
+        }),
+        summary: inspected.items[0],
+        issuerName: issuer?.name || issuerId,
+      };
+      render();
+    } catch (e) {
+      showToast(errMsg(e), 'error');
+    }
+  });
+
+  // CSR Preview Modal
+  const closeCSRPreview = () => {
+    state.csrPreview = null;
+    render();
+  };
+  document.getElementById('btn-csrpreview-cancel')?.addEventListener('click', closeCSRPreview);
+  document.getElementById('btn-csrpreview-no')?.addEventListener('click', closeCSRPreview);
+  document.getElementById('btn-csrpreview-confirm')?.addEventListener('click', async () => {
+    if (!state.csrPreview) return;
+    try {
+      await SignCSR(state.csrPreview.request);
+      state.csrPreview = null;
       showToast('CSR signed and certificate saved to vault', 'success');
       state.page = 'vault';
       await refreshVault();
@@ -1707,26 +1987,72 @@ function attachHandlers() {
     });
   });
 
-  document.getElementById('btn-reveal-key')?.addEventListener('click', async () => {
-    if (!state.selectedItem) return;
+  document.getElementById('btn-reveal-key')?.addEventListener('click', () => {
+    const item = state.selectedItem;
+    if (!item) return;
     if (state.revealedKey) {
-      await navigator.clipboard.writeText(state.revealedKey);
-      showToast('Private key copied to clipboard', 'success');
+      state.revealedKey = null;
+      render();
       return;
     }
-    try {
-      state.revealedKey = await RevealPrivateKey(state.selectedItem.id);
-      render();
-    } catch (e) {
-      showToast(errMsg(e), 'error');
-    }
+    state.passwordPrompt = {
+      title: 'Verify Master Password',
+      message: `Enter your master password to reveal the private key for "${item.name}".`,
+      confirmLabel: 'Reveal Key',
+      onSubmit: async (pw) => {
+        const key = await RevealPrivateKey(item.id, pw);
+        state.revealedKey = key;
+        state.passwordPrompt = null;
+        if (keyHideTimer !== null) window.clearTimeout(keyHideTimer);
+        keyHideTimer = window.setTimeout(() => {
+          state.revealedKey = null;
+          render();
+        }, 30000);
+        render();
+      },
+    };
+    render();
+  });
+
+  document.getElementById('btn-copy-key-temp')?.addEventListener('click', () => {
+    const item = state.selectedItem;
+    if (!item) return;
+    state.passwordPrompt = {
+      title: 'Copy Private Key (Auto-Clear 30s)',
+      message: `Enter your master password to copy the private key for "${item.name}". Clipboard will clear automatically in 30 seconds.`,
+      confirmLabel: 'Copy Key',
+      onSubmit: async (pw) => {
+        await CopyPrivateKeyTemporarily(item.id, pw);
+        state.passwordPrompt = null;
+        render();
+        showToast('Private key copied — clipboard will auto-clear in 30s', 'success');
+      },
+    };
+    render();
   });
 
   document.querySelectorAll<HTMLElement>('[data-export]').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      if (!state.selectedItem) return;
+      const item = state.selectedItem;
+      if (!item) return;
+      const format = btn.dataset.export!;
+      if (format === 'key') {
+        state.passwordPrompt = {
+          title: 'Export Unencrypted Private Key',
+          message: `Enter your master password to export the unencrypted PKCS#8 private key for "${item.name}".`,
+          confirmLabel: 'Export .key',
+          onSubmit: async (pw) => {
+            const saved = await ExportArtifact(item.id, 'key', '', pw);
+            state.passwordPrompt = null;
+            render();
+            if (saved) showToast(`Saved to ${saved}`, 'success');
+          },
+        };
+        render();
+        return;
+      }
       try {
-        const saved = await ExportArtifact(state.selectedItem.id, btn.dataset.export!, '');
+        const saved = await ExportArtifact(item.id, format, '', '');
         if (saved) showToast(`Saved to ${saved}`, 'success');
       } catch (e) {
         showToast(errMsg(e), 'error');
@@ -1740,24 +2066,85 @@ function attachHandlers() {
     render();
   });
 
+  document.getElementById('btn-export-crl')?.addEventListener('click', async () => {
+    if (!state.selectedItem) return;
+    try {
+      const saved = await ExportCRL(state.selectedItem.id, 30);
+      if (saved) showToast(`Saved CRL to ${saved}`, 'success');
+    } catch (e) {
+      showToast(errMsg(e), 'error');
+    }
+  });
+
+  document.getElementById('btn-revoke-item')?.addEventListener('click', () => {
+    const target = state.selectedItem;
+    if (!target) return;
+    state.confirmDialog = {
+      title: 'Revoke Certificate',
+      message: `Mark "${target.name}" as revoked? You can then export an updated CRL from its issuing CA.`,
+      confirmLabel: 'Revoke',
+      onConfirm: async () => {
+        await RevokeItem(target.id, 0);
+        state.confirmDialog = null;
+        await refreshVault();
+        state.selectedItem = state.items.find((i) => i.id === target.id) || null;
+        render();
+        showToast('Certificate marked as revoked', 'success');
+      },
+    };
+    render();
+  });
+
   document.getElementById('btn-delete-item')?.addEventListener('click', () => {
     const target = state.selectedItem;
     if (!target) return;
+    const isCA = target.kind === 'root_ca' || target.kind === 'intermediate_ca';
+    if (isCA) {
+      state.passwordPrompt = {
+        title: 'Delete Certificate Authority',
+        message: `Deleting CA "${target.name}" permanently removes its private key. Enter your master password to confirm.`,
+        confirmLabel: 'Delete CA',
+        danger: true,
+        onSubmit: async (pw) => {
+          await DeleteItem(target.id, pw);
+          clearSensitiveUIState();
+          await refreshVault();
+          showToast('CA deleted');
+        },
+      };
+      render();
+      return;
+    }
     state.confirmDialog = {
       title: 'Delete Item',
       message: `Are you sure you want to permanently delete "${target.name}" from your encrypted vault?`,
       confirmLabel: 'Delete',
       onConfirm: async () => {
-        await DeleteItem(target.id);
-        state.selectedItem = null;
-        state.selectedPEMs = null;
-        state.revealedKey = null;
-        state.confirmDialog = null;
+        await DeleteItem(target.id, '');
+        clearSensitiveUIState();
         await refreshVault();
         showToast('Item deleted');
       },
     };
     render();
+  });
+
+  // Password Prompt Modal
+  const closePwPrompt = () => {
+    state.passwordPrompt = null;
+    render();
+  };
+  document.getElementById('btn-pwprompt-cancel')?.addEventListener('click', closePwPrompt);
+  document.getElementById('btn-pwprompt-no')?.addEventListener('click', closePwPrompt);
+  document.getElementById('form-pwprompt')?.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    if (!state.passwordPrompt) return;
+    const pw = (document.getElementById('pwprompt-input') as HTMLInputElement).value;
+    try {
+      await state.passwordPrompt.onSubmit(pw);
+    } catch (e) {
+      showToast(errMsg(e), 'error');
+    }
   });
 
   // Confirm Dialog
@@ -1786,10 +2173,20 @@ function attachHandlers() {
   document.getElementById('form-p12')?.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const id = state.p12ExportTargetId;
+    const masterPw = (document.getElementById('p12-master-pass') as HTMLInputElement).value;
     const pw = (document.getElementById('p12-pass') as HTMLInputElement).value;
+    const confirmPw = (document.getElementById('p12-pass-confirm') as HTMLInputElement).value;
     if (!id) return;
+    if (pw.length < 8) {
+      showToast('PKCS#12 bundle password must be at least 8 characters', 'error');
+      return;
+    }
+    if (pw !== confirmPw) {
+      showToast('PKCS#12 bundle passwords do not match', 'error');
+      return;
+    }
     try {
-      const saved = await ExportArtifact(id, 'p12', pw);
+      const saved = await ExportArtifact(id, 'p12', pw, masterPw);
       state.p12ExportTargetId = null;
       render();
       if (saved) showToast(`Saved PKCS#12 to ${saved}`, 'success');
@@ -1803,16 +2200,28 @@ function attachHandlers() {
     state.showChangePasswordModal = false;
     render();
   });
+  document.getElementById('cpw-new')?.addEventListener('input', (e) => {
+    const hint = document.getElementById('cpw-strength-hint');
+    if (!hint) return;
+    const res = passwordStrengthLabel((e.target as HTMLInputElement).value);
+    hint.textContent = res.text;
+    hint.style.color = res.color;
+  });
   document.getElementById('form-cpw')?.addEventListener('submit', async (ev) => {
     ev.preventDefault();
+    const currentPw = (document.getElementById('cpw-current') as HTMLInputElement).value;
     const pw = (document.getElementById('cpw-new') as HTMLInputElement).value;
     const confirmPw = (document.getElementById('cpw-confirm') as HTMLInputElement).value;
+    if (pw.length < 12) {
+      showToast('New master password must be at least 12 characters', 'error');
+      return;
+    }
     if (pw !== confirmPw) {
-      showToast('Passwords do not match', 'error');
+      showToast('New passwords do not match', 'error');
       return;
     }
     try {
-      await ChangeVaultPassword(pw);
+      await ChangeVaultPassword(currentPw, pw);
       state.showChangePasswordModal = false;
       render();
       showToast('Vault password updated', 'success');
